@@ -1,0 +1,73 @@
+#!/bin/bash
+
+# Run Elasticsearch and allow setting default settings via env vars
+#
+# e.g. Setting the env var cluster.name=testcluster
+#
+# will cause Elasticsearch to be invoked with -Ecluster.name=testcluster
+#
+# see https://www.elastic.co/guide/en/elasticsearch/reference/current/settings.html#_setting_default_settings
+
+declare -a es_opts
+
+BASE=/usr/share/elasticsearch
+
+# allow for memlock
+ulimit -l unlimited
+
+while IFS='=' read -r envvar_key envvar_value
+do
+    # Elasticsearch env vars need to have at least two dot separated lowercase words, e.g. `cluster.name`
+    if [[ "$envvar_key" =~ ^[a-z_]+\.[a-z_]+ ]]
+    then
+        if [[ ! -z $envvar_value ]]; then
+          es_opt="-E${envvar_key}=${envvar_value}"
+          es_opts+=("${es_opt}")
+        fi
+    fi
+done < <(env)
+
+# Prevent "Text file busy" errors
+sync
+
+if [ ! -z "${ES_PLUGINS_INSTALL}" ]; then
+   OLDIFS=$IFS
+   IFS=','
+   for plugin in ${ES_PLUGINS_INSTALL}; do
+      if ! $BASE/bin/elasticsearch-plugin list | grep -qs ${plugin}; then
+         yes | $BASE/bin/elasticsearch-plugin install --batch ${plugin}
+      fi
+   done
+   IFS=$OLDIFS
+fi
+
+if [ ! -z "${SHARD_ALLOCATION_AWARENESS_ATTR}" ]; then
+    # this will map to a file like  /etc/hostname => /dockerhostname so reading that file will get the
+    #  container hostname
+    if [ "$NODE_DATA" == "true" ]; then
+        ES_SHARD_ATTR=`cat ${SHARD_ALLOCATION_AWARENESS_ATTR}`
+        NODE_NAME="${ES_SHARD_ATTR}-${NODE_NAME}"
+        echo "node.attr.${SHARD_ALLOCATION_AWARENESS}: ${ES_SHARD_ATTR}" >> $BASE/config/elasticsearch.yml
+    fi
+    if [ "$NODE_MASTER" == "true" ]; then
+        echo "cluster.routing.allocation.awareness.attributes: ${SHARD_ALLOCATION_AWARENESS}" >> $BASE/config/elasticsearch.yml
+    fi
+fi
+
+# run
+chown -R elasticsearch:elasticsearch $BASE
+# The virtual file /proc/self/cgroup should list the current cgroup
+# membership. For each hierarchy, you can follow the cgroup path from
+# this file to the cgroup filesystem (usually /sys/fs/cgroup/) and
+# introspect the statistics for the cgroup for the given
+# hierarchy. Alas, Docker breaks this by mounting the container
+# statistics at the root while leaving the cgroup paths as the actual
+# paths. Therefore, Elasticsearch provides a mechanism to override
+# reading the cgroup path from /proc/self/cgroup and instead uses the
+# cgroup path defined the JVM system property
+# es.cgroups.hierarchy.override. Therefore, we set this value here so
+# that cgroup statistics are available for the container this process
+# will run in.
+export ES_JAVA_OPTS="-Des.cgroups.hierarchy.override=/ $ES_JAVA_OPTS"
+
+su-exec elasticsearch $BASE/bin/elasticsearch "${es_opts[@]}"
